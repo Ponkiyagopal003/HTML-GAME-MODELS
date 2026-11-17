@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Procedural Butterfly — AAA Flight</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #04060c; overflow: hidden; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; left: 18px; bottom: 16px;
+    color: #8fb8ff; font: 11px/1.6 ui-monospace, "SF Mono", Menlo, monospace;
+    letter-spacing: .22em; text-transform: uppercase; opacity: .5;
+    pointer-events: none; user-select: none;
+  }
+  #hud b { color: #ffb066; font-weight: 500; }
+</style>
+</head>
+<body>
+<div id="hud">Procedural Butterfly &nbsp;·&nbsp; <b>WebGL</b> &nbsp;·&nbsp; move mouse to look</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer }   from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass }       from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass }  from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass }       from 'three/addons/postprocessing/OutputPass.js';
+
+/* ═══════════════════════════════════════════════════════════════════════
+   01 · RENDERER / SCENE / CAMERA
+   ═══════════════════════════════════════════════════════════════════════ */
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const MAX_ANISO = renderer.capabilities.getMaxAnisotropy();
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x04060c);
+scene.fog = new THREE.FogExp2(0x04060c, 0.021);
+
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 400);
+camera.position.set(6, 3.2, 9);
+
+/* ═══════════════════════════════════════════════════════════════════════
+   02 · ENVIRONMENT MAP (procedural equirect — auto-converted to PMREM)
+   ═══════════════════════════════════════════════════════════════════════ */
+function makeEnvTexture() {
+  const c = document.createElement('canvas');
+  c.width = 512; c.height = 256;
+  const ctx = c.getContext('2d');
+
+  const g = ctx.createLinearGradient(0, 0, 0, 256);
+  g.addColorStop(0.00, '#0b1836');
+  g.addColorStop(0.42, '#1b3768');
+  g.addColorStop(0.52, '#3a2114');
+  g.addColorStop(0.72, '#160a08');
+  g.addColorStop(1.00, '#05030a');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 512, 256);
+
+  // warm sun blob
+  const sun = ctx.createRadialGradient(150, 96, 2, 150, 96, 80);
+  sun.addColorStop(0, 'rgba(255,214,150,1)');
+  sun.addColorStop(0.35, 'rgba(255,150,60,0.35)');
+  sun.addColorStop(1, 'rgba(255,120,0,0)');
+  ctx.fillStyle = sun;
+  ctx.fillRect(0, 0, 512, 256);
+
+  // cool bounce blob
+  const cool = ctx.createRadialGradient(400, 150, 2, 400, 150, 110);
+  cool.addColorStop(0, 'rgba(90,160,255,0.75)');
+  cool.addColorStop(1, 'rgba(40,90,200,0)');
+  ctx.fillStyle = cool;
+  ctx.fillRect(0, 0, 512, 256);
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.mapping = THREE.EquirectangularReflectionMapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+scene.environment = makeEnvTexture();
+
+/* ═══════════════════════════════════════════════════════════════════════
+   03 · LIGHTING RIG
+   ═══════════════════════════════════════════════════════════════════════ */
+scene.add(new THREE.HemisphereLight(0x9fc4ff, 0x1a0e14, 0.55));
+
+const keyLight = new THREE.DirectionalLight(0xffd9a8, 2.8);
+keyLight.position.set(6, 9, 5);
+scene.add(keyLight);
+
+const rimLight = new THREE.DirectionalLight(0x5fa8ff, 2.4);
+rimLight.position.set(-7, 4, -6);
+scene.add(rimLight);
+
+const fillLight = new THREE.PointLight(0xff5fa8, 55, 34, 2);
+fillLight.position.set(-4.5, -3, 4);
+scene.add(fillLight);
+
+const bottomLight = new THREE.PointLight(0x66ffe0, 30, 26, 2);
+bottomLight.position.set(3, -4, -2);
+scene.add(bottomLight);
+
+/* ═══════════════════════════════════════════════════════════════════════
+   04 · WING GEOMETRY HELPERS
+   ═══════════════════════════════════════════════════════════════════════ */
+
+// gentle upward cup of the wing membrane (returns local Z before rotateX)
+const wingCurve = (x, y) => -0.028 * x * x - 0.020 * y * y;
+
+/* ---- Outline definitions (shared by Three.Shape AND Canvas2D) ---- */
+function forewingOutline(p) {
+  p.moveTo(0.00, 0.05);
+  p.bezierCurveTo(0.70, 1.05, 1.70, 1.55, 2.60, 1.15);   // costal / leading edge
+  p.bezierCurveTo(2.95, 0.95, 3.05, 0.35, 2.75, -0.15);  // outer margin
+  p.bezierCurveTo(2.40, -0.65, 1.30, -0.75, 0.00, -0.45); // inner margin
+  p.closePath();
+}
+function hindwingOutline(p) {
+  p.moveTo(0.00, -0.30);
+  p.bezierCurveTo(1.05, -0.30, 1.95, -0.70, 2.20, -1.40);
+  p.bezierCurveTo(2.35, -2.05, 1.60, -2.55, 0.95, -2.40);
+  p.bezierCurveTo(0.35, -2.25, 0.05, -1.45, 0.00, -0.85);
+  p.closePath();
+}
+
+/* ---- Vein networks (quadratic: a=root, c=control, b=tip) ---- */
+const FORE_VEINS = [
+  { a: [ 0.05,  0.05], c: [1.30, 0.95], b: [2.55,  1.00] },
+  { a: [ 0.02,  0.02], c: [1.20, 0.60], b: [2.58,  0.55] },
+  { a: [ 0.00,  0.00], c: [1.30, 0.20], b: [2.88,  0.12] },
+  { a: [ 0.00, -0.08], c: [1.20,-0.15], b: [2.62, -0.25] },
+  { a: [ 0.00, -0.15], c: [0.90,-0.35], b: [1.88, -0.60] },
+];
+const HIND_VEINS = [
+  { a: [ 0.02, -0.40], c: [0.95, -0.70], b: [1.95, -1.25] },
+  { a: [ 0.02, -0.60], c: [0.90, -1.15], b: [1.85, -1.80] },
+  { a: [ 0.02, -0.80], c: [0.75, -1.55], b: [1.35, -2.15] },
+  { a: [ 0.02, -0.95], c: [0.50, -1.75], b: [0.85, -2.30] },
+];
+
+/* ---- Palettes ---- */
+const FORE_PAL = {
+  inner: '#ffb347', mid: '#ff7300', outer: '#b32d00',
+  glow0: 'rgba(255,236,185,0.78)', glow1: 'rgba(255,120,20,0.18)',
+  vein: 'rgba(24,10,4,0.92)', veinSoft: 'rgba(46,20,9,0.42)',
+  spot: 'rgba(255,248,235,0.95)', border: 'rgba(16,6,3,0.95)'
+};
+const HIND_PAL = {
+  inner: '#ffc266', mid: '#ff6a00', outer: '#8f2200',
+  glow0: 'rgba(255,226,165,0.65)', glow1: 'rgba(255,100,10,0.16)',
+  vein: 'rgba(24,10,4,0.92)', veinSoft: 'rgba(46,20,9,0.38)',
+  spot: 'rgba(255,248,235,0.95)', border: 'rgba(16,6,3,0.95)'
+};
+
+/* ---- Quadratic point evaluator ---- */
+function quadPoint(v, t) {
+  const mt = 1 - t;
+  return [
+    mt * mt * v.a[0] + 2 * mt * t * v.c[0] + t * t * v.b[0],
+    mt * mt * v.a[1] + 2 * mt * t * v.c[1] + t * t * v.b[1]
+  ];
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   05 · WING TEXTURE PAINTER  (drawn directly in wing-space coords)
+   ═══════════════════════════════════════════════════════════════════════ */
+function drawWingTexture(ctx, shape, outlineFn, veins, prm, pal) {
+  const { minX, minY, maxX, maxY, w, h } = prm;
+  const pad = 1;
+
+  /* 1 — base gradient */
+  const g = ctx.createLinearGradient(minX, minY, maxX, maxY);
+  g.addColorStop(0.00, pal.inner);
+  g.addColorStop(0.45, pal.mid);
+  g.addColorStop(1.00, pal.outer);
+  ctx.fillStyle = g;
+  ctx.fillRect(minX - pad, minY - pad, w + pad * 2, h + pad * 2);
+
+  /* 2 — iridescent root glow */
+  const rg = ctx.createRadialGradient(0, -0.1, 0.02, 0, -0.1, Math.max(w, h) * 0.95);
+  rg.addColorStop(0.00, pal.glow0);
+  rg.addColorStop(0.35, pal.glow1);
+  rg.addColorStop(1.00, 'rgba(0,0,0,0)');
+  ctx.fillStyle = rg;
+  ctx.fillRect(minX - pad, minY - pad, w + pad * 2, h + pad * 2);
+
+  /* 3 — primary veins */
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = pal.vein;
+  ctx.lineWidth = 0.085;
+  for (const v of veins) {
+    ctx.beginPath();
+    ctx.moveTo(v.a[0], v.a[1]);
+    ctx.quadraticCurveTo(v.c[0], v.c[1], v.b[0], v.b[1]);
+    ctx.stroke();
+  }
+
+  /* 4 — cross veins (fine lattice) */
+  ctx.strokeStyle = pal.veinSoft;
+  ctx.lineWidth = 0.028;
+  for (let i = 0; i < veins.length - 1; i++) {
+    for (const t of [0.42, 0.68]) {
+      const p1 = quadPoint(veins[i], t);
+      const p2 = quadPoint(veins[i + 1], t);
+      ctx.beginPath();
+      ctx.moveTo(p1[0], p1[1]);
+      ctx.quadraticCurveTo((p1[0] + p2[0]) * 0.5, (p1[1] + p2[1]) * 0.5 + 0.10, p2[0], p2[1]);
+      ctx.stroke();
+    }
+  }
+
+  /* 5 — thick outer border (stroke of the real outline) */
+  ctx.beginPath();
+  outlineFn(ctx);
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = 0.34;
+  ctx.strokeStyle = pal.border;
+  ctx.stroke();
+
+  /* 6 — marginal white spots, inset from the border */
+  const pts = shape.getPoints(48);
+  ctx.fillStyle = pal.spot;
+  for (let i = 0; i < pts.length; i += 8) {
+    const p = pts[i];
+    if (p.x < 1.0) continue;
+    const dx = -p.x, dy = -0.15 - p.y;
+    const L = Math.hypot(dx, dy) || 1;
+    const cx = p.x + (dx / L) * 0.27;
+    const cy = p.y + (dy / L) * 0.27;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 0.052, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   06 · WING BUILDER
+   ═══════════════════════════════════════════════════════════════════════ */
+function createWing(outlineFn, veins, pal) {
+  const grp = new THREE.Group();
+  const S = 1024;
+
+  /* --- shape + geometry --- */
+  const shape = new THREE.Shape();
+  outlineFn(shape);
+
+  const geo = new THREE.ShapeGeometry(shape, 36);
+  geo.computeBoundingBox();
+  const bb = geo.boundingBox;
+  const minX = bb.min.x, maxX = bb.max.x, minY = bb.min.y, maxY = bb.max.y;
+  const w = maxX - minX, h = maxY - minY;
+
+  // uniform texture transform (letterboxed) — also used for UVs
+  const s  = S / Math.max(w, h);
+  const ox = (S - w * s) * 0.5;
+  const oy = (S - h * s) * 0.5;
+
+  const pos = geo.attributes.position;
+  const uvArr = new Float32Array(pos.count * 2);
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), y = pos.getY(i);
+    pos.setZ(i, wingCurve(x, y));                       // membrane curvature
+    uvArr[i * 2]     = (s * (x - minX) + ox) / S;
+    uvArr[i * 2 + 1] = 1 - (s * (maxY - y) + oy) / S;
+  }
+  geo.setAttribute('uv', new THREE.BufferAttribute(uvArr, 2));
+  geo.rotateX(Math.PI / 2);                             // XY plane → XZ plane (forward = +Z)
+  geo.computeVertexNormals();
+
+  /* --- canvas texture --- */
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = S;
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(s, 0, 0, -s, -minX * s + ox, maxY * s + oy);
+  drawWingTexture(ctx, shape, outlineFn, veins, { minX, minY, maxX, maxY, w, h }, pal);
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = MAX_ANISO;
+
+  /* --- membrane material --- */
+  const mat = new THREE.MeshStandardMaterial({
+    map: tex,
+    side: THREE.DoubleSide,
+    roughness: 0.55,
+    metalness: 0.18,
+    emissive: new THREE.Color(0xff6a12),
+    emissiveMap: tex,
+    emissiveIntensity: 0.14,
+    transparent: true,
+    opacity: 0.96,
+    envMapIntensity: 0.9
+  });
+  grp.add(new THREE.Mesh(geo, mat));
+
+  /* --- 3D raised veins --- */
+  const veinMat = new THREE.MeshStandardMaterial({
+    color: 0x120a06, roughness: 0.38, metalness: 0.35, envMapIntensity: 1.1
+  });
+  for (const v of veins) {
+    const c2 = new THREE.QuadraticBezierCurve(
+      new THREE.Vector2(v.a[0], v.a[1]),
+      new THREE.Vector2(v.c[0], v.c[1]),
+      new THREE.Vector2(v.b[0], v.b[1])
+    );
+    const pts3 = c2.getPoints(16).map(p =>
+      new THREE.Vector3(p.x, p.y, wingCurve(p.x, p.y) - 0.022)
+    );
+    const tg = new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts3), 24, 0.020, 6, false);
+    tg.rotateX(Math.PI / 2);
+    grp.add(new THREE.Mesh(tg, veinMat));
+  }
+
+  return grp;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   07 · BUTTERFLY ASSEMBLY
+   ═══════════════════════════════════════════════════════════════════════ */
+function createButterfly() {
+  const root = new THREE.Group();
+  const bodyGroup = new THREE.Group();
+  root.add(bodyGroup);
+
+  /* ---------- segmented body (lathe) ---------- */
+  const profileData = [
+    [0.004,-1.02],[0.050,-0.95],[0.085,-0.80],[0.115,-0.60],[0.140,-0.38],
+    [0.158,-0.14],[0.170, 0.10],[0.175, 0.30],[0.160, 0.45],[0.125, 0.56],
+    [0.095, 0.63],[0.100, 0.72],[0.125, 0.82],[0.128, 0.90],[0.100, 0.97],
+    [0.050, 1.02],[0.006, 1.05]
+  ];
+  const profile = profileData.map(p => new THREE.Vector2(p[0], p[1]));
+
+  const bodyGeo = new THREE.LatheGeometry(profile, 40);
+  bodyGeo.rotateX(Math.PI / 2);
+  bodyGeo.computeVertexNormals();
+
+  const bodyMat = new THREE.MeshStandardMaterial({
+    color: 0x2a1a14,
+    roughness: 0.42,
+    metalness: 0.55,
+    envMapIntensity: 1.15,
+    emissive: 0x170700,
+    emissiveIntensity: 0.7
+  });
+  bodyGroup.add(new THREE.Mesh(bodyGeo, bodyMat));
+
+  /* ---------- compound eyes ---------- */
+  const eyeGeo = new THREE.SphereGeometry(0.055, 20, 16);
+  const eyeMat = new THREE.MeshStandardMaterial({
+    color: 0x0a0508, roughness: 0.12, metalness: 0.92, envMapIntensity: 1.8
+  });
+  for (const sx of [-1, 1]) {
+    const e = new THREE.Mesh(eyeGeo, eyeMat);
+    e.position.set(sx * 0.095, 0.045, 0.90);
+    e.scale.set(1.0, 1.15, 1.1);
+    bodyGroup.add(e);
+  }
+
+  const limbMat = new THREE.MeshStandardMaterial({
+    color: 0x1a1012, roughness: 0.5, metalness: 0.4, envMapIntensity: 0.9
+  });
+
+  /* ---------- antennae ---------- */
+  for (const sx of [-1, 1]) {
+    const pts = [
+      new THREE.Vector3(sx * 0.035, 0.10, 0.94),
+      new THREE.Vector3(sx * 0.100, 0.28, 1.16),
+      new THREE.Vector3(sx * 0.200, 0.50, 1.28),
+      new THREE.Vector3(sx * 0.310, 0.63, 1.28)
+    ];
+    const tg = new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), 26, 0.011, 6, false);
+    bodyGroup.add(new THREE.Mesh(tg, limbMat));
+
+    const club = new THREE.Mesh(new THREE.SphereGeometry(0.032, 14, 10), limbMat);
+    club.position.copy(pts[3]);
+    club.scale.set(1, 0.85, 1.3);
+    bodyGroup.add(club);
+  }
+
+  /* ---------- legs ---------- */
+  for (const sx of [-1, 1]) {
+    for (let i = 0; i < 3; i++) {
+      const z0 = 0.52 - i * 0.22;
+      const pts = [
+        new THREE.Vector3(sx * 0.060, -0.130, z0),
+        new THREE.Vector3(sx * 0.180, -0.340, z0 + 0.06),
+        new THREE.Vector3(sx * 0.300, -0.520, z0 + 0.14),
+        new THREE.Vector3(sx * 0.360, -0.560, z0 + 0.28)
+      ];
+      const tg = new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), 18, 0.012, 6, false);
+      bodyGroup.add(new THREE.Mesh(tg, limbMat));
+    }
+  }
+
+  /* ---------- wings ---------- */
+  const build = (outlineFn, veins, pal, pivot, side) => {
+    const g = new THREE.Group();
+    g.position.copy(pivot);
+    if (side < 0) g.scale.x = -1;         // mirror left side
+    g.add(createWing(outlineFn, veins, pal));
+    root.add(g);
+    return g;
+  };
+
+  const foreR = build(forewingOutline, FORE_VEINS, FORE_PAL, new THREE.Vector3( 0.055,  0.10, 0.30),  1);
+  const foreL = build(forewingOutline, FORE_VEINS, FORE_PAL, new THREE.Vector3(-0.055,  0.10, 0.30), -1);
+  const hindR = build(hindwingOutline, HIND_VEINS, HIND_PAL, new THREE.Vector3( 0.055, -0.04, 0.02),  1);
+  const hindL = build(hindwingOutline, HIND_VEINS, HIND_PAL, new THREE.Vector3(-0.055, -0.04, 0.02), -1);
+
+  return { root, bodyGroup, foreL, foreR, hindL, hindR };
+}
+
+const butterfly = createButterfly();
+butterfly.root.scale.setScalar(0.5);
+scene.add(butterfly.root);
+
+/* ═══════════════════════════════════════════════════════════════════════
+   08 · ATMOSPHERIC PARTICLES (pollen / spores)
+   ═══════════════════════════════════════════════════════════════════════ */
+function dotTexture() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 64;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+  g.addColorStop(0.0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.25, 'rgba(190,225,255,0.55)');
+  g.addColorStop(1.0, 'rgba(120,180,255,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 64, 64);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+const P_COUNT = 750;
+const pPos = new Float32Array(P_COUNT * 3);
+const pSpd = new Float32Array(P_COUNT);
+for (let i = 0; i < P_COUNT; i++) {
+  pPos[i * 3]     = (Math.random() - 0.5) * 46;
+  pPos[i * 3 + 1] = (Math.random() - 0.5) * 26;
+  pPos[i * 3 + 2] = (Math.random() - 0.5) * 46;
+  pSpd[i] = 0.10 + Math.random() * 0.45;
+}
+const pGeo = new THREE.BufferGeometry();
+pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+const pMat = new THREE.PointsMaterial({
+  size: 0.13,
+  map: dotTexture(),
+  color: 0x9fd0ff,
+  transparent: true,
+  opacity: 0.55,
+  blending: THREE.AdditiveBlending,
+  depthWrite: false,
+  sizeAttenuation: true
+});
+const particles = new THREE.Points(pGeo, pMat);
+particles.frustumCulled = false;
+scene.add(particles);
+
+/* ═══════════════════════════════════════════════════════════════════════
+   09 · FLIGHT PATH
+   ═══════════════════════════════════════════════════════════════════════ */
+function pathAt(u, out) {
+  out.set(
+    Math.sin(u * 0.62) * 3.2 + Math.sin(u * 1.37 + 0.8) * 0.90,
+    0.6 + Math.sin(u * 0.90 + 1.2) * 1.50 + Math.sin(u * 2.10) * 0.35,
+    Math.cos(u * 0.47) * 3.4 + Math.cos(u * 1.70 + 0.4) * 0.70
+  );
+  return out;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   10 · POST-PROCESSING
+   ═══════════════════════════════════════════════════════════════════════ */
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+
+const bloom = new UnrealBloomPass(
+  new THREE.Vector2(window.innerWidth, window.innerHeight),
+  0.85,   // strength
+  0.60,   // radius
+  0.82    // threshold
+);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+/* ═══════════════════════════════════════════════════════════════════════
+   11 · INTERACTION (mouse parallax)
+   ═══════════════════════════════════════════════════════════════════════ */
+const mouse = { x: 0, y: 0 };
+window.addEventListener('pointermove', e => {
+  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = (e.clientY / window.innerHeight) * 2 - 1;
+});
+
+/* ═══════════════════════════════════════════════════════════════════════
+   12 · ANIMATION LOOP
+   ═══════════════════════════════════════════════════════════════════════ */
+const clock = new THREE.Clock();
+let elapsed = 0;
+
+const P  = new THREE.Vector3();
+const P2 = new THREE.Vector3();
+const camTarget = new THREE.Vector3();
+const camDesired = new THREE.Vector3();
+
+const _m    = new THREE.Matrix4();
+const _q    = new THREE.Quaternion();
+const _roll = new THREE.Quaternion();
+const _up   = new THREE.Vector3(0, 1, 0);
+const _zAx  = new THREE.Vector3(0, 0, 1);
+
+const FLAP_HZ  = 9.0;
+const D2R      = Math.PI / 180;
+
+function updateButterfly(dt, t) {
+  const u = t * 0.42;
+
+  /* ---- position along path ---- */
+  pathAt(u, P);
+  pathAt(u + 0.02, P2);
+
+  const beat = Math.sin(t * FLAP_HZ);
+  P.y += beat * 0.075;                       // lift from wing beat
+
+  butterfly.root.position.copy(P);
+
+  /* ---- orientation (banking + smooth slerp) ---- */
+  const bank = Math.sin(u * 1.15) * 0.42 + Math.sin(t * FLAP_HZ) * 0.05;
+  _m.lookAt(P2, P, _up);                     // +Z (head) points along flight dir
+  _q.setFromRotationMatrix(_m);
+  _roll.setFromAxisAngle(_zAx, bank);
+  _q.multiply(_roll);
+
+  const k = 1 - Math.pow(0.0004, dt);
+  butterfly.root.quaternion.slerp(_q, k);
+
+  /* ---- wing flap ---- */
+  const ease = v => Math.sign(v) * Math.pow(Math.abs(v), 0.68);
+
+  const sF = ease(Math.sin(t * FLAP_HZ));
+  const sH = ease(Math.sin(t * FLAP_HZ - 0.70));   // hindwing lags
+
+  const foreA = (16 + 40 * sF) * D2R;
+  const hindA = (12 + 36 * sH) * D2R;
+
+  butterfly.foreR.rotation.z =  foreA;
+  butterfly.foreL.rotation.z = -foreA;
+  butterfly.hindR.rotation.z =  hindA;
+  butterfly.hindL.rotation.z = -hindA;
+
+  // wing twist / pitch (symmetric: mirrored group shares the same X rotation)
+  const twist = 0.20 * sF;
+  butterfly.foreR.rotation.x = twist;
+  butterfly.foreL.rotation.x = twist;
+  butterfly.hindR.rotation.x = 0.14 * sH;
+  butterfly.hindL.rotation.x = 0.14 * sH;
+
+  // fore/hind slight fore-aft sweep
+  butterfly.foreR.rotation.y =  0.10 * sF;
+  butterfly.foreL.rotation.y = -0.10 * sF;
+
+  /* ---- body counter-motion ---- */
+  butterfly.bodyGroup.rotation.x = -0.06 * beat;
+  butterfly.bodyGroup.position.y =  0.02 * Math.sin(t * FLAP_HZ + 0.4);
+}
+
+function updateParticles(dt, t) {
+  const arr = pGeo.attributes.position.array;
+  for (let i = 0; i < P_COUNT; i++) {
+    const iy = i * 3 + 1;
+    arr[iy] += pSpd[i] * dt;
+    arr[i * 3] += Math.sin(t * 0.4 + i) * 0.0025;
+    if (arr[iy] > 13) arr[iy] = -13;
+  }
+  pGeo.attributes.position.needsUpdate = true;
+}
+
+function updateCamera(dt, t) {
+  const orbit = t * 0.15;
+  camDesired.set(
+    P.x + Math.sin(orbit) * 7.6 + mouse.x * 1.4,
+    P.y + 2.3 + Math.sin(t * 0.4) * 1.1 - mouse.y * 1.0,
+    P.z + Math.cos(orbit) * 7.6
+  );
+  camera.position.lerp(camDesired, 1 - Math.pow(0.0005, dt));
+
+  camTarget.lerp(P, 1 - Math.pow(0.0001, dt));
+  camera.lookAt(camTarget);
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  elapsed += dt;
+
+  updateButterfly(dt, elapsed);
+  updateParticles(dt, elapsed);
+  updateCamera(dt, elapsed);
+
+  // travelling light pulses for extra life
+  fillLight.position.x = -4.5 + Math.sin(elapsed * 0.7) * 2.0;
+  fillLight.position.y = -3.0 + Math.cos(elapsed * 0.55) * 1.5;
+  bottomLight.position.x = 3 + Math.cos(elapsed * 0.45) * 2.5;
+
+  composer.render();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   13 · RESIZE
+   ═══════════════════════════════════════════════════════════════════════ */
+window.addEventListener('resize', () => {
+  const w = window.innerWidth, h = window.innerHeight;
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(w, h);
+  composer.setSize(w, h);
+  bloom.setSize(w, h);
+});
+
+animate();
+</script>
+</body>
+</html>
